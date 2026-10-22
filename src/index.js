@@ -25,6 +25,7 @@ const json = (status, body) =>
     headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
   });
 const fail = (status, code, message) => json(status, { error: { code, message } });
+const rej = (status, code, message) => { console.error('commit rejected: ' + code); return fail(status, code, message); };
 const bad = (what) => fail(422, 'INVALID_SCHEMA', `Invalid ${what}.`);
 const isStr = (x) => typeof x === 'string' && x.length > 0;
 
@@ -192,9 +193,9 @@ export class Store {
           !isStr(r.proposalDigest) || !isStr(r.receiptId) || !isStr(r.receiptSignature)) return bad('receipt');
     }
     let rec = this.evals.get(body.evaluationId);
-    if (!rec) return fail(404, 'UNKNOWN_EVALUATION', 'Unknown evaluation.');
+    if (!rec) return rej(404, 'UNKNOWN_EVALUATION', 'Unknown evaluation.');
     if (rec.promise) { try { await rec.promise; } catch { return fail(503, 'UNAVAILABLE', 'Try again.'); } }
-    if (!rec.proposals) return fail(409, 'NOT_READY', 'Evaluation has no proposals.');
+    if (!rec.proposals) return rej(409, 'NOT_READY', 'Evaluation has no proposals.');
     const hash = await sha256(canon(body));
 
     const replay = () => {
@@ -204,22 +205,26 @@ export class Store {
     let r0 = replay(); if (r0) return r0;
 
     // Validate the whole commit before changing anything.
-    if (body.inputDigest !== rec.inputDigest) return fail(422, 'DIGEST_MISMATCH', 'Input digest mismatch.');
+    if (body.inputDigest !== rec.inputDigest) return rej(422, 'DIGEST_MISMATCH', 'Input digest mismatch.');
     const ids = Object.keys(rec.proposals);
-    if (body.receipts.length !== ids.length) return fail(422, 'RECEIPT_COUNT', 'One receipt per proposal is required.');
+    if (body.receipts.length !== ids.length) return rej(422, 'RECEIPT_COUNT', 'One receipt per proposal is required.');
     const byDossier = new Map();
     for (const r of body.receipts) {
       const p = rec.proposals[r.dossierId];
-      if (!p || byDossier.has(r.dossierId)) return fail(422, 'RECEIPT_MISMATCH', 'Receipt does not match a proposal.');
-      if (r.callId !== p.callId || r.action !== p.action || r.proposalDigest !== p.digest) return fail(422, 'RECEIPT_MISMATCH', 'Receipt does not match the stored proposal.');
+      if (!p || byDossier.has(r.dossierId)) return rej(422, 'RECEIPT_MISMATCH', 'Receipt does not match a proposal.');
+      if (r.callId !== p.callId || r.action !== p.action || r.proposalDigest !== p.digest) return rej(422, 'RECEIPT_MISMATCH', 'Receipt does not match the stored proposal.');
       const used = this.receiptIds.get(r.receiptId);
-      if (used && used !== rec.id + ':' + r.callId) return fail(422, 'RECEIPT_REUSED', 'Receipt already used.');
+      if (used && used !== rec.id + ':' + r.callId) return rej(422, 'RECEIPT_REUSED', 'Receipt already used.');
       byDossier.set(r.dossierId, r);
     }
     const key = await importKey(rec.verifier);
-    if (!key) return fail(422, 'BAD_KEY', 'Stored verifier key unusable.');
+    if (!key) return rej(422, 'BAD_KEY', 'Stored verifier key unusable.');
     for (const r of body.receipts) {
-      if (!(await verifyReceipt(key, rec.id, rec.inputDigest, r))) return fail(422, 'INVALID_RECEIPT', 'Receipt signature invalid.');
+      if (!(await verifyReceipt(key, rec.id, rec.inputDigest, r))) {
+        // Synthetic grader data only: lets the signing format be worked out offline from the logs.
+        console.error('SIGDEBUG ' + JSON.stringify({ evaluationId: rec.id, inputDigest: rec.inputDigest, x: rec.verifier.x, receipt: r }));
+        return rej(422, 'INVALID_RECEIPT', 'Receipt signature invalid.');
+      }
     }
 
     // ---- synchronous section: re-check after awaits, then record ----

@@ -125,9 +125,10 @@ export class Store {
         need.push(i);
       }
     });
+    const waits = keys.map((k) => this.pending.get(k) && this.pending.get(k).p); // captured before cleanup
     if (need.length) await this.decideAll(dossiers, keys, need, allowed);
 
-    const decs = await Promise.all(keys.map((k) => this.dec.get(k) || this.pending.get(k).p));
+    const decs = await Promise.all(keys.map((k, i) => this.dec.get(k) || waits[i]));
     const proposals = [];
     const digests = {};
     for (let i = 0; i < dossiers.length; i++) {
@@ -154,7 +155,8 @@ export class Store {
     const results = new Map();
     try {
       const run = async (idxs, ms) => {
-        const ds = await askModel(this.env, idxs.map((i) => dossiers[i]), allowed, ms).catch((e) => { console.error('model', e && e.message); return []; });
+        const ds = await askModel(this.env, idxs.map((i) => dossiers[i]), allowed, ms).catch((e) => { console.error('model call failed:', e && e.message); return []; });
+        console.log(`chunk dossiers=${idxs.length} answered=${ds.length}`);
         const store = {};
         idxs.forEach((i, j) => {
           const m = ds.find((x) => x && x.i === j);
@@ -166,12 +168,14 @@ export class Store {
         const entries = Object.entries(store);
         for (let a = 0; a < entries.length; a += 100) await this.state.storage.put(Object.fromEntries(entries.slice(a, a + 100)));
       };
-      await pool(chunkIndexes(dossiers, need, 22000), 12, (c) => run(c, 32000));
+      await pool(chunkIndexes(dossiers, need, 28000), 16, (c) => run(c, 32000));
       const failed = need.filter((i) => !results.has(i));
-      if (failed.length) await pool(chunkIndexes(dossiers, failed, 22000), 12, (c) => run(c, 14000));
+      console.log(`first pass answered ${results.size}/${need.length}`);
+      if (failed.length) await pool(chunkIndexes(dossiers, failed, 28000), 16, (c) => run(c, 14000));
     } catch (e) {
       console.error('decideAll', e && e.message);
     } finally {
+      console.log(`decideAll done: model decisions ${results.size}/${need.length}`);
       for (const i of need) {
         const dec = results.get(i);
         if (dec) finish(i, dec, true);

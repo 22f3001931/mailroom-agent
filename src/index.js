@@ -26,13 +26,17 @@ const json = (status, body) =>
     headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
   });
 const fail = (status, code, message) => json(status, { error: { code, message } });
-const rej = (status, code, message) => { console.error('commit rejected: ' + code); return fail(status, code, message); };
+let DBG = () => {};
+let CUR = '';
+const rej = (status, code, message) => { DBG('commit rejected', { code, message, evaluationId: CUR }); return fail(status, code, message); };
 const bad = (what) => fail(422, 'INVALID_SCHEMA', `Invalid ${what}.`);
 const isStr = (x) => typeof x === 'string' && x.length > 0;
 
 /* ---------- Worker entry ---------- */
 export default {
   async fetch(req, env) {
+    if (req.method === 'GET' && new URL(req.url).pathname === '/__debug')
+      return env.STORE.get(env.STORE.idFromName('main')).fetch('https://store.internal/__debug');
     if (req.method !== 'POST') return fail(405, 'METHOD_NOT_ALLOWED', 'Use POST.');
     if (Number(req.headers.get('content-length') || 0) > MAX_BODY) return fail(413, 'TOO_LARGE', 'Body too large.');
     const text = await req.text();
@@ -51,6 +55,7 @@ export class Store {
     this.dec = new Map(); // "dossierId:fingerprint" -> decision (persisted)
     this.pending = new Map(); // in-flight decisions (memory only; coordination, not durable state)
     this.receiptIds = new Map(); // receiptId -> "evaluationId:callId"
+    DBG = (label, data) => this.dbg(label, data);
     state.blockConcurrencyWhile(async () => {
       for (const [k, v] of await state.storage.list()) {
         if (k.startsWith('eval:')) {
@@ -66,7 +71,16 @@ export class Store {
     return this.state.storage.put('eval:' + rec.id, clean);
   }
 
+  dbg(label, data) {
+    const key = 'dbg:' + String(Date.now()).padStart(15, '0') + Math.random().toString(36).slice(2, 6);
+    return this.state.storage.put(key, { t: new Date().toISOString(), label, data }).catch(() => {});
+  }
+
   async fetch(req) {
+    if (req.method === 'GET') {
+      const m = await this.state.storage.list({ prefix: 'dbg:', reverse: true, limit: 80 });
+      return json(200, [...m.values()].reverse());
+    }
     let body;
     try { body = JSON.parse(await req.text()); } catch { return fail(400, 'BAD_JSON', 'Malformed JSON.'); }
     if (!body || typeof body !== 'object' || Array.isArray(body)) return fail(400, 'BAD_REQUEST', 'Expected a JSON object.');
@@ -153,10 +167,11 @@ export class Store {
     const audit = d.partition === 'fresh_audit';
     if (audit ? this.logged.audit >= 6 : this.logged.core >= 4 || i % 11 !== 0) return;
     this.logged[audit ? 'audit' : 'core']++;
-    console.log('SAMPLE ' + JSON.stringify({ partition: d.partition, mailbox: d.mailbox, objective: d.objective, receivedAt: d.receivedAt, sources: d.sources, model: m, final: { action: dec.action, target: dec.target, payload: dec.payload, evidence: dec.evidence } }));
+    DBG('SAMPLE', { partition: d.partition, mailbox: d.mailbox, objective: d.objective, receivedAt: d.receivedAt, sources: d.sources, model: m, final: { action: dec.action, target: dec.target, payload: dec.payload, evidence: dec.evidence } });
   }
 
   async decideAll(dossiers, keys, need, allowed) {
+    const errs = []; const t0 = Date.now();
     const finish = (i, dec, cache) => {
       const k = keys[i];
       const pend = this.pending.get(k);
@@ -167,8 +182,7 @@ export class Store {
     const results = new Map();
     try {
       const run = async (idxs, ms) => {
-        const ds = await askModel(this.env, idxs.map((i) => dossiers[i]), allowed, ms).catch((e) => { console.error('model call failed:', e && e.message); return []; });
-        console.log(`chunk dossiers=${idxs.length} answered=${ds.length}`);
+        const ds = await askModel(this.env, idxs.map((i) => dossiers[i]), allowed, ms).catch((e) => { errs.push(String((e && e.message) || e).slice(0, 200)); return []; });
         const store = {};
         idxs.forEach((i, j) => {
           const m = ds.find((x) => x && x.i === j);
@@ -183,22 +197,25 @@ export class Store {
       };
       await pool(chunkIndexes(dossiers, need, 16000), 24, (c) => run(c, 36000));
       const failed = need.filter((i) => !results.has(i));
-      console.log(`first pass answered ${results.size}/${need.length}`);
       if (failed.length) await pool(chunkIndexes(dossiers, failed, 16000), 24, (c) => run(c, 10000));
     } catch (e) {
       console.error('decideAll', e && e.message);
     } finally {
-      console.log(`decideAll done: model decisions ${results.size}/${need.length}`);
+      const fb = {};
       for (const i of need) {
-        const dec = results.get(i);
-        if (dec) finish(i, dec, true);
-        else finish(i, { ...quarantineFallback(dossiers[i]), valid: false }, false); // safe fallback, not cached
+        const dec = results.get(i) || { ...quarantineFallback(dossiers[i]), valid: false, fallback: true };
+        if (!results.has(i)) fb['dec:' + keys[i]] = dec;
+        finish(i, dec, true); // fallbacks are cached too, so a dossier gets one stable decision per version
       }
+      const fe = Object.entries(fb);
+      for (let a = 0; a < fe.length; a += 100) await this.state.storage.put(Object.fromEntries(fe.slice(a, a + 100))).catch(() => {});
+      DBG('decideAll', { dossiers: need.length, modelDecisions: results.size, fallbacks: fe.length, ms: Date.now() - t0, errors: errs.slice(0, 6) });
     }
   }
 
   /* ----- commit ----- */
   async commit(body) {
+    CUR = typeof body.evaluationId === 'string' ? body.evaluationId : '';
     if (!isStr(body.evaluationId) || !isStr(body.inputDigest) || !Array.isArray(body.receipts) || !body.receipts.length) return bad('commit');
     for (const r of body.receipts) {
       if (!r || typeof r !== 'object' || !isStr(r.dossierId) || !isStr(r.callId) || !isStr(r.action) || typeof r.accepted !== 'boolean' ||
@@ -234,7 +251,7 @@ export class Store {
     for (const r of body.receipts) {
       if (!(await verifyReceipt(key, rec.id, rec.inputDigest, r))) {
         // Synthetic grader data only: lets the signing format be worked out offline from the logs.
-        console.error('SIGDEBUG ' + JSON.stringify({ evaluationId: rec.id, inputDigest: rec.inputDigest, x: rec.verifier.x, receipt: r }));
+        DBG('SIGDEBUG', { evaluationId: rec.id, inputDigest: rec.inputDigest, x: rec.verifier.x, receipt: r });
         return rej(422, 'INVALID_RECEIPT', 'Receipt signature invalid.');
       }
     }
@@ -249,6 +266,7 @@ export class Store {
     rec.commit = { hash, response, receipts: body.receipts.map((r) => ({ callId: r.callId, receiptId: r.receiptId, accepted: r.accepted })) };
     for (const r of body.receipts) this.receiptIds.set(r.receiptId, rec.id + ':' + r.callId);
     await this.persistEval(rec); // stored before replying
+    DBG('commit ok', { evaluationId: rec.id });
     return json(200, response);
   }
 }
@@ -311,11 +329,16 @@ function receiptCandidates(evalId, inputDigest, r) {
   const core = ['callId', 'proposalDigest', 'accepted', 'receiptId'];
   const opt = ['evaluationId', 'dossierId', 'action', 'inputDigest', 'profile'];
   const natural = ['profile', 'evaluationId', 'inputDigest', 'dossierId', 'callId', 'action', 'proposalDigest', 'accepted', 'receiptId'];
+  const specOrder = ['profile', 'evaluationId', 'inputDigest', 'dossierId', 'callId', 'action', 'accepted', 'proposalDigest', 'receiptId'];
   const out = [];
   for (let mask = 0; mask < 32; mask++) {
     const keys = new Set([...core, ...opt.filter((_, i) => mask & (1 << i))]);
     const sub = {}; for (const k of keys) sub[k] = f[k];
     out.push([`json:${mask}`, canon(sub)]);
+    for (const [on, order] of [['nat', natural], ['spec', specOrder]]) {
+      const o = {}; for (const k of order) if (keys.has(k)) o[k] = f[k];
+      out.push([`jsonins:${mask}:${on}`, JSON.stringify(o)]);
+    }
     for (const [on, order] of [['nat', natural.filter((k) => keys.has(k))], ['alpha', [...keys].sort()]]) {
       for (const acc of ['true', 'True']) {
         const vals = order.map((k) => (k === 'accepted' ? (r.accepted ? acc : acc === 'true' ? 'false' : 'False') : String(f[k])));
@@ -332,7 +355,7 @@ async function verifyReceipt(k, evalId, inputDigest, r) {
   const cands = receiptCandidates(evalId, inputDigest, r);
   if (HINT) cands.sort((x, y) => (x[0] === HINT ? -1 : y[0] === HINT ? 1 : 0));
   for (const [label, m] of cands) {
-    try { if (await crypto.subtle.verify(k.algo, k.key, sig, enc.encode(m))) { if (label !== HINT) { HINT = label; console.log('receipt format matched: ' + label); } return true; } } catch {}
+    try { if (await crypto.subtle.verify(k.algo, k.key, sig, enc.encode(m))) { if (label !== HINT) { HINT = label; DBG('receipt format matched', label); } return true; } } catch {}
   }
   return false;
 }

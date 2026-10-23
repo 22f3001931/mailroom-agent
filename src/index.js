@@ -250,8 +250,6 @@ export class Store {
     if (!key) return rej(422, 'BAD_KEY', 'Stored verifier key unusable.');
     for (const r of body.receipts) {
       if (!(await verifyReceipt(key, rec.id, rec.inputDigest, r))) {
-        // Synthetic grader data only: lets the signing format be worked out offline from the logs.
-        DBG('SIGDEBUG', { evaluationId: rec.id, inputDigest: rec.inputDigest, x: rec.verifier.x, receipt: r });
         return rej(422, 'INVALID_RECEIPT', 'Receipt signature invalid.');
       }
     }
@@ -319,45 +317,18 @@ function b64bytes(s) {
   } catch { return null; }
 }
 
-// The spec section "How to verify a receipt signature" was not available, so the signed bytes are unknown.
-// We try many plausible encodings (canonical JSON of field subsets, or fields joined by a separator).
-// Every encoding always binds callId + proposalDigest + accepted + receiptId, so a flipped `accepted`, a
-// tampered digest or a receipt from another proposal can never verify. Replace with the documented format.
-let HINT = null; // label of the encoding that verified last time (tried first)
-function receiptCandidates(evalId, inputDigest, r) {
-  const f = { profile: PROFILE, evaluationId: evalId, inputDigest, dossierId: r.dossierId, callId: r.callId, action: r.action, accepted: r.accepted, proposalDigest: r.proposalDigest, receiptId: r.receiptId };
-  const core = ['callId', 'proposalDigest', 'accepted', 'receiptId'];
-  const opt = ['evaluationId', 'dossierId', 'action', 'inputDigest', 'profile'];
-  const natural = ['profile', 'evaluationId', 'inputDigest', 'dossierId', 'callId', 'action', 'proposalDigest', 'accepted', 'receiptId'];
-  const specOrder = ['profile', 'evaluationId', 'inputDigest', 'dossierId', 'callId', 'action', 'accepted', 'proposalDigest', 'receiptId'];
-  const out = [];
-  for (let mask = 0; mask < 32; mask++) {
-    const keys = new Set([...core, ...opt.filter((_, i) => mask & (1 << i))]);
-    const sub = {}; for (const k of keys) sub[k] = f[k];
-    out.push([`json:${mask}`, canon(sub)]);
-    for (const [on, order] of [['nat', natural], ['spec', specOrder]]) {
-      const o = {}; for (const k of order) if (keys.has(k)) o[k] = f[k];
-      out.push([`jsonins:${mask}:${on}`, JSON.stringify(o)]);
-    }
-    for (const [on, order] of [['nat', natural.filter((k) => keys.has(k))], ['alpha', [...keys].sort()]]) {
-      for (const acc of ['true', 'True']) {
-        const vals = order.map((k) => (k === 'accepted' ? (r.accepted ? acc : acc === 'true' ? 'false' : 'False') : String(f[k])));
-        for (const [si, sep] of ['|', ':', '\n', '.', ',', ''].entries()) out.push([`join:${mask}:${on}:${acc}:${si}`, vals.join(sep)]);
-      }
-    }
-  }
-  return out;
-}
-
+// Documented format: recursively key-sorted compact JSON of
+// { profile, evaluationId, inputDigest, receipt: {dossierId, callId, action, accepted, proposalDigest, receiptId} }
 async function verifyReceipt(k, evalId, inputDigest, r) {
   const sig = b64bytes(r.receiptSignature);
   if (!sig || sig.length !== 64) return false;
-  const cands = receiptCandidates(evalId, inputDigest, r);
-  if (HINT) cands.sort((x, y) => (x[0] === HINT ? -1 : y[0] === HINT ? 1 : 0));
-  for (const [label, m] of cands) {
-    try { if (await crypto.subtle.verify(k.algo, k.key, sig, enc.encode(m))) { if (label !== HINT) { HINT = label; DBG('receipt format matched', label); } return true; } } catch {}
-  }
-  return false;
+  const msg = canon({
+    profile: PROFILE,
+    evaluationId: evalId,
+    inputDigest,
+    receipt: { dossierId: r.dossierId, callId: r.callId, action: r.action, accepted: r.accepted, proposalDigest: r.proposalDigest, receiptId: r.receiptId },
+  });
+  try { return await crypto.subtle.verify(k.algo, k.key, sig, enc.encode(msg)); } catch { return false; }
 }
 
 /* ---------- safe proposal builders (the model picks action + evidence; code derives every argument) ---------- */

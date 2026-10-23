@@ -6,7 +6,7 @@ const PROFILE = 'ga5-mailroom-action-gate/v2';
 const ACTIONS = ['create_draft', 'update_internal_record', 'send_approved_notice', 'request_confirmation', 'quarantine_item', 'no_action'];
 const NO_ACTION_REASONS = ['ALREADY_COMPLETED', 'DUPLICATE', 'INFORMATIONAL'];
 const MAX_BODY = 3_000_000;
-const VER = 'v3:'; // bump to discard cached decisions after prompt/model changes
+const VER = 'v4:'; // bump to discard cached decisions after prompt/model/code changes
 const enc = new TextEncoder();
 
 /* ---------- helpers ---------- */

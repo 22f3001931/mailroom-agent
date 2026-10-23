@@ -309,11 +309,13 @@ async function importKey(jwk) {
 }
 
 function b64bytes(s) {
+  // Strict canonical base64 only: an Ed25519 signature is exactly 64 bytes (86 chars + "=="), and re-encoding
+  // must give back the same string so malleable encodings (non-zero padding bits, whitespace) are refused.
+  if (typeof s !== 'string' || !/^[A-Za-z0-9+/]{86}==$/.test(s)) return null;
   try {
-    let t = s.replace(/-/g, '+').replace(/_/g, '/');
-    while (t.length % 4) t += '=';
-    const bin = atob(t);
-    return Uint8Array.from(bin, (c) => c.charCodeAt(0));
+    const bytes = Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+    let bin = ''; for (const x of bytes) bin += String.fromCharCode(x);
+    return btoa(bin) === s ? bytes : null;
   } catch { return null; }
 }
 

@@ -415,7 +415,7 @@ function build(d, m) {
       break;
     }
     case 'send_approved_notice': {
-      const ap = live.find((l) => l.kind === 'approval' && TRUSTED_RE.test(l.prov) && /authoriz/i.test(l.text) && /approved_delivery_notice/.test(l.text) && new RegExp(EMAIL).test(l.text));
+      const ap = live.find((l) => l.kind === 'approval' && TRUSTED_RE.test(l.prov) && /approved_delivery_notice/.test(l.text) && new RegExp(EMAIL).test(l.text));
       if (!ap) return null;
       const rcp = ap.text.match(new RegExp('\\bto\\s+(' + EMAIL + ')')) || ap.text.match(new RegExp(EMAIL));
       const ref = ap.text.match(ID.ord);
@@ -455,6 +455,7 @@ function build(d, m) {
       payload = { claimedSender: who.v, questionCode: 'VERIFY_REQUEST', referenceId: ref.v };
       need.push(who.v, ref.v);
       if (teamLine && !teamLine.decoy) extra.push(teamLine.id);
+      extra.push(who.line.id); // the request being verified
       break;
     }
     case 'quarantine_item': {
@@ -471,7 +472,7 @@ function build(d, m) {
       payload = { artifactId: art, reasonCode: 'INDIRECT_PROMPT_INJECTION' };
       const hostile = srcLines.filter((l) => !(attLine && l.id === attLine.id));
       extra.push(...base.map((l) => l.id));
-      if (!base.some((l) => hostile.some((h) => h.id === l.id))) extra.push(...hostile.map((l) => l.id)); // cited only the id line: add the hostile text
+      extra.push(...hostile.map((l) => l.id)); // every live line of the hostile source
       if (attLine) extra.push(attLine.id);
       break;
     }
@@ -522,18 +523,21 @@ function quarantineFallback(d) {
 function scenarioAction(d) {
   const t = d.sources.filter((x) => x.kind === 'policy' && TRUSTED_RE.test(x.provenance || ''))
     .flatMap((x) => x.lines.map((l) => l.text)).filter((x) => !GENERIC_POLICY_RE.test(x)).join(' ');
-  if (/contact mismatch|challenge by the responsible/i.test(t)) return 'request_confirmation';
-  if (/already-handled|information-only|no additional effect/i.test(t)) return 'no_action';
-  if (/status request without sender verification|written up in the mailbox/i.test(t)) return 'create_draft';
-  if (/isolate untrusted|tries to control tools/i.test(t)) return 'quarantine_item';
+  if (/contact mismatch|challenge by the responsible|identity conflicts|owning approval queue/i.test(t)) return 'request_confirmation';
+  if (/already-handled|information-only|no additional effect|already completed|duplicate/i.test(t)) return 'no_action';
+  if (/status request without sender verification|written up in the mailbox|unverified inbound status enquiry|create a draft in the owning mailbox|unverified enquiries permit|unsent response only/i.test(t)) return 'create_draft';
+  if (/isolate untrusted|tries to control tools|quarantine external content|direct tool use/i.test(t)) return 'quarantine_item';
+  if (/carrier event may update|case-field mutation|named case field/i.test(t)) return 'update_internal_record';
+  if (/only current evidence within the named case and recipient scope/i.test(t)) return 'send_approved_notice';
   return null;
 }
 
 function finalize(d, m, allowed) {
   const sa = scenarioAction(d);
   const order = [];
-  if (sa && sa !== m.action) order.push(sa); // strong template signal beats a disagreeing model answer
+  if (sa && sa !== m.action && sa !== 'send_approved_notice') order.push(sa); // strong template signal beats a disagreeing model answer
   order.push(m.action);
+  if (sa === 'send_approved_notice' && sa !== m.action) order.push(sa); // weaker signal: only a fallback
   if (m.action === 'send_approved_notice') order.push('create_draft', 'request_confirmation'); // never send on weak evidence
   else if (m.action === 'create_draft') order.push('request_confirmation');
   for (const a of [...new Set(order)]) {

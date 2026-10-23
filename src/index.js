@@ -6,7 +6,7 @@ const PROFILE = 'ga5-mailroom-action-gate/v2';
 const ACTIONS = ['create_draft', 'update_internal_record', 'send_approved_notice', 'request_confirmation', 'quarantine_item', 'no_action'];
 const NO_ACTION_REASONS = ['ALREADY_COMPLETED', 'DUPLICATE', 'INFORMATIONAL'];
 const MAX_BODY = 3_000_000;
-const VER = 'v4:'; // bump to discard cached decisions after prompt/model/code changes
+const VER = 'v5:'; // bump to discard cached decisions after prompt/model/code changes
 const enc = new TextEncoder();
 
 /* ---------- helpers ---------- */
@@ -227,10 +227,9 @@ export class Store {
     if (!rec.proposals) return rej(409, 'NOT_READY', 'Evaluation has no proposals.');
     const hash = await sha256(canon(body));
 
-    const replay = () => {
-      if (!rec.commit) return null;
-      return rec.commit.hash === hash ? json(200, rec.commit.response) : fail(409, 'COMMIT_CONFLICT', 'Evaluation already committed with different content.');
-    };
+    // Exact replay returns the stored result; a different body on a committed evaluation is validated
+    // first (invalid receipts are always rejected as such) and only then reported as a conflict.
+    const replay = () => (rec.commit && rec.commit.hash === hash ? json(200, rec.commit.response) : null);
     let r0 = replay(); if (r0) return r0;
 
     // Validate the whole commit before changing anything.
@@ -256,6 +255,7 @@ export class Store {
 
     // ---- synchronous section: re-check after awaits, then record ----
     r0 = replay(); if (r0) return r0;
+    if (rec.commit) return rej(409, 'COMMIT_CONFLICT', 'Evaluation already committed with different content.');
     const outcomes = ids.map((dossierId) => {
       const r = byDossier.get(dossierId);
       return { dossierId, callId: r.callId, action: r.action, proposalDigest: r.proposalDigest, receiptId: r.receiptId, status: r.accepted === true ? 'executed' : 'rejected' };
@@ -449,8 +449,12 @@ function build(d, m) {
     }
     case 'no_action': {
       const ref = orderRef() || first(ID.cas, (l) => ['message', 'record'].includes(l.kind));
-      let rc = NO_ACTION_REASONS.includes(m.reasonCode) ? m.reasonCode : null;
-      if (!rc) { const t = citedLive.map((l) => l.text).join(' '); rc = /duplicate|repeated/i.test(t) ? 'DUPLICATE' : /completed|already|terminal/i.test(t) ? 'ALREADY_COMPLETED' : 'INFORMATIONAL'; }
+      // The authenticated record states the case state; it decides the reason code (the model's guess is only a fallback).
+      const recTxt = live.filter((l) => l.kind === 'record' && TRUSTED_RE.test(l.prov)).map((l) => l.text).join(' ');
+      let rc = /\bduplicate\b/i.test(recTxt) ? 'DUPLICATE'
+        : /already completed|\bcompleted\b|terminal event/i.test(recTxt) ? 'ALREADY_COMPLETED'
+        : /informational|information-only/i.test(recTxt) ? 'INFORMATIONAL' : null;
+      if (!rc) rc = NO_ACTION_REASONS.includes(m.reasonCode) ? m.reasonCode : 'INFORMATIONAL';
       if (!ref) return null;
       target = null;
       payload = { reasonCode: rc, referenceId: ref.v };
